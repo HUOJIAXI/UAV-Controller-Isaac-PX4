@@ -109,20 +109,43 @@ class ControlPanelNode(Node):
         """Handle controller status."""
         self.controller_status = msg.data
 
-    def send_target(self, x, y, z, yaw=0.0):
-        """Publish target pose."""
+    def send_target(self, right_body, fwd_body, dz, yaw=0.0):
+        """
+        Publish target pose using body-frame offsets (user: forward/right).
+
+        Internally use aircraft FLU axes (x=fwd, y=left). User "Right" is -body Y.
+        Vertical input dz is relative to current altitude (body Up).
+        """
+        cur_x, cur_y, cur_z = self.current_position
+        yaw_curr = self.current_attitude[2]  # ENU yaw, CCW about +Z
+
+        # Map user offsets to FLU: x=fwd, y=left
+        x_fwd = fwd_body
+        y_left = -right_body
+
+        cos_y = math.cos(yaw_curr)
+        sin_y = math.sin(yaw_curr)
+        # body->world: world = Rz(yaw) * body
+        dx = x_fwd * cos_y - y_left * sin_y
+        dy = x_fwd * sin_y + y_left * cos_y
+
+        target_x = cur_x + dx
+        target_y = cur_y + dy
+        target_z = cur_z + dz
+
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
-        msg.pose.position.x = float(x)
-        msg.pose.position.y = float(y)
-        msg.pose.position.z = float(z)
+        msg.pose.position.x = float(target_x)
+        msg.pose.position.y = float(target_y)
+        msg.pose.position.z = float(target_z)
         msg.pose.orientation.z = math.sin(yaw / 2)
         msg.pose.orientation.w = math.cos(yaw / 2)
         self.target_pub.publish(msg)
         self.get_logger().info(
-            f'Target: [{x:.2f}, {y:.2f}, {z:.2f}], '
-            f'yaw={math.degrees(yaw):.1f} deg')
+            f'Target body offsets: fwd {fwd_body:.2f} m, right {right_body:.2f} m, up {dz:.2f} m, '
+            f'world: [{target_x:.2f}, {target_y:.2f}, {target_z:.2f}], '
+            f'yaw_cmd={math.degrees(yaw):.1f} deg')
 
     def call_trigger_service(self, client, name):
         """Call a Trigger service (non-blocking from GUI thread)."""
@@ -231,7 +254,7 @@ class ControlPanelGUI:
         ttk.Label(pos_frame, text='Position:', width=12).pack(side=tk.LEFT)
         self.pos_label = ttk.Label(
             pos_frame,
-            text='Fwd(Y):   0.000  Right(X):   0.000  Up(Z):   0.000',
+            text='East:   0.000  North:   0.000  Up:   0.000',
             font=('Courier', 10))
         self.pos_label.pack(side=tk.LEFT, padx=10)
 
@@ -241,7 +264,7 @@ class ControlPanelGUI:
         ttk.Label(vel_frame, text='Velocity:', width=12).pack(side=tk.LEFT)
         self.vel_label = ttk.Label(
             vel_frame,
-            text='Vfwd: 0.000  Vright: 0.000  Vup: 0.000',
+            text='Vfwd(body): 0.000  Vright(body): 0.000  Vup: 0.000',
             font=('Courier', 10))
         self.vel_label.pack(side=tk.LEFT, padx=10)
 
@@ -301,11 +324,11 @@ class ControlPanelGUI:
             main_frame, text='Target Position', padding='10')
         target_frame.pack(fill=tk.X, pady=5)
 
-        # Slider rows (sim frame: X=East, Y=North, Z=Up)
+        # Slider rows (body-frame offsets: fwd/right relative to current yaw; Up is delta Z)
         for label, var_name, lo, hi, default, unit in [
-            ('Fwd(Y):', 'y_var', -5.0, 5.0, 0.0, 'm'),
-            ('Right(X):', 'x_var', -5.0, 5.0, 0.0, 'm'),
-            ('Up(Z):', 'z_var', 0.0, 5.0, 1.5, 'm'),
+            ('Fwd (body):', 'y_var', -5.0, 5.0, 0.0, 'm'),
+            ('Right (body):', 'x_var', -5.0, 5.0, 0.0, 'm'),
+            ('Up ΔZ (body):', 'z_var', -3.0, 5.0, 0.0, 'm'),
             ('Yaw:', 'yaw_var', -180.0, 180.0, 0.0, 'deg'),
         ]:
             row = ttk.Frame(target_frame)
@@ -363,10 +386,11 @@ class ControlPanelGUI:
         row2.pack(fill=tk.X, pady=3)
 
         for text, d in [
-            ('Fwd 0.5', (0, 0.5, 0)),
-            ('Back 0.5', (0, -0.5, 0)),
-            ('Left 0.5', (-0.5, 0, 0)),
-            ('Right 0.5', (0.5, 0, 0)),
+            # Body-frame deltas: forward/right are relative to current yaw
+            ('Fwd 0.5', (0.0, 0.5, 0)),
+            ('Back 0.5', (0.0, -0.5, 0)),
+            ('Left 0.5', (-0.5, 0.0, 0)),   # left = -right_body
+            ('Right 0.5', (0.5, 0.0, 0)),   # right = +right_body
             ('Up 0.5', (0, 0, 0.5)),
             ('Down 0.5', (0, 0, -0.5)),
         ]:
@@ -381,13 +405,13 @@ class ControlPanelGUI:
 
         tk.Button(
             row3, text='Yaw L 15',
-            command=lambda: self._yaw_relative(-15),
+            command=lambda: self._yaw_relative(15),   # CCW (left) = +yaw
             bg='#696969', fg='white', width=9
         ).pack(side=tk.LEFT, padx=2)
 
         tk.Button(
             row3, text='Yaw R 15',
-            command=lambda: self._yaw_relative(15),
+            command=lambda: self._yaw_relative(-15),  # CW (right) = -yaw
             bg='#696969', fg='white', width=9
         ).pack(side=tk.LEFT, padx=2)
 
@@ -428,11 +452,18 @@ class ControlPanelGUI:
             text=f'{self.node.control_mode} | '
                  f'controller: {self.node.controller_status}')
 
+        # Position shown in world ENU to avoid ambiguity
         self.pos_label.config(
-            text=f'Fwd(Y): {pos[1]:7.3f}  Right(X): {pos[0]:7.3f}  '
-                 f'Up(Z): {pos[2]:7.3f}')
+            text=f'East: {pos[0]:7.3f}  North: {pos[1]:7.3f}  Up: {pos[2]:7.3f}')
+
+        # Velocities shown in body frame (FLU) for intuitive forward/right readout
+        yaw = att[2]  # rad, ENU
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        v_fwd = vel[0] * cos_y + vel[1] * sin_y
+        v_right = -vel[0] * sin_y + vel[1] * cos_y
         self.vel_label.config(
-            text=f'Vfwd: {vel[1]:6.3f}  Vright: {vel[0]:6.3f}  '
+            text=f'Vfwd(body): {v_fwd:6.3f}  Vright(body): {v_right:6.3f}  '
                  f'Vup: {vel[2]:6.3f}')
         self.att_label.config(
             text=f'R: {att[0]:6.2f}   P: {att[1]:6.2f}   '
@@ -535,42 +566,48 @@ class ControlPanelGUI:
         thread.start()
 
     def _on_send_target(self):
-        """Send target from sliders."""
-        x = self.x_var.get()
-        y = self.y_var.get()
-        z = self.z_var.get()
+        """Send target from sliders (body-frame offsets, delta Z)."""
+        x_body = self.x_var.get()
+        y_body = self.y_var.get()
+        dz = self.z_var.get()
         yaw = math.radians(self.yaw_var.get())
-        self.node.send_target(x, y, z, yaw)
+        self.node.send_target(x_body, y_body, dz, yaw)
 
     def _on_hold_position(self):
-        """Hold current position."""
-        pos = self.node.current_position
+        """Hold current position: zero offsets, keep current yaw, ΔZ=0."""
         att = self.node.current_attitude
-        self.x_var.set(round(pos[0], 2))
-        self.y_var.set(round(pos[1], 2))
-        self.z_var.set(round(max(pos[2], 0.5), 2))
+        self.x_var.set(0.0)
+        self.y_var.set(0.0)
+        self.z_var.set(0.0)
         self.yaw_var.set(round(math.degrees(att[2]), 1))
-        self.node.send_target(
-            pos[0], pos[1], max(pos[2], 0.5), att[2])
+        self.node.send_target(0.0, 0.0, 0.0, att[2])
 
-    def _quick_target(self, x, y, z):
-        """Send a quick target."""
+    def _quick_target(self, x_body, y_body, dz):
+        """Send a quick target (body offsets, delta Z)."""
         yaw = math.radians(self.yaw_var.get())
-        self.x_var.set(x)
-        self.y_var.set(y)
-        self.z_var.set(z)
-        self.node.send_target(x, y, z, yaw)
+        self._reset_offsets()
+        self.x_var.set(x_body)
+        self.y_var.set(y_body)
+        self.z_var.set(dz)
+        self.node.send_target(x_body, y_body, dz, yaw)
 
-    def _move_relative(self, dx, dy, dz):
-        """Move relative to current target."""
-        x = self.x_var.get() + dx
-        y = self.y_var.get() + dy
-        z = max(self.z_var.get() + dz, 0.1)
+    def _move_relative(self, dx_body, dy_body, dz):
+        """Quick action: reset offsets then apply body-frame delta (non-accumulating)."""
+        self._reset_offsets()
+        x = dx_body
+        y = dy_body
+        z = dz
         self.x_var.set(round(x, 2))
         self.y_var.set(round(y, 2))
         self.z_var.set(round(z, 2))
         yaw = math.radians(self.yaw_var.get())
         self.node.send_target(x, y, z, yaw)
+
+    def _reset_offsets(self):
+        """Zero body-frame offset sliders (keep yaw)."""
+        self.x_var.set(0.0)
+        self.y_var.set(0.0)
+        self.z_var.set(0.0)
 
     def _yaw_relative(self, dyaw_deg):
         """Rotate yaw relative to current target."""

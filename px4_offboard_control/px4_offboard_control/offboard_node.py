@@ -858,7 +858,8 @@ class OffboardControlNode(Node):
         import math
         roll_rad = math.radians(att[0])
         pitch_rad = math.radians(att[1])
-        yaw_rad = math.radians(att[2])
+        # Convert PX4 yaw (clockwise from North, NED) to ENU/ROS yaw (CCW from East)
+        yaw_rad = math.radians(90.0 - att[2])
 
         cr = math.cos(roll_rad / 2)
         sr = math.sin(roll_rad / 2)

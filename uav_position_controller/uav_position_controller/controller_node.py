@@ -368,15 +368,17 @@ class PositionControllerNode(Node):
         acc_z = self.vel_pid_z.compute(vel_err_z, dt) + self.gravity
 
         # === Acceleration to Attitude Conversion ===
-        # Transform world-frame acceleration to body frame using current yaw.
-        # World frame after NED→sim swap: X=East, Y=North, Z=Up
-        # NED yaw: 0=North, 90=East (clockwise from North)
-        # Body forward at yaw ψ in sim frame: [sin(ψ), cos(ψ)]
+        # Transform world-frame acceleration (ENU, yaw CCW from East) to body frame.
+        # ENU axes: X=East, Y=North, Z=Up. Body x = forward.
+        # Rotation ENU->body about Z (using R(-ψ) to body FLU, then flip Y to FRD):
+        # FLU: [acc_flu_x] = [ cosψ  sinψ] [acc_x]
+        #      [acc_flu_y]   [-sinψ  cosψ] [acc_y]
+        # Convert FLU to FRD: acc_body_y = -acc_flu_y (right positive)
         cos_yaw = math.cos(self.current_yaw)
         sin_yaw = math.sin(self.current_yaw)
 
-        acc_body_x = acc_x * sin_yaw + acc_y * cos_yaw
-        acc_body_y = acc_x * cos_yaw - acc_y * sin_yaw
+        acc_body_x = acc_x * cos_yaw + acc_y * sin_yaw
+        acc_body_y = acc_x * sin_yaw - acc_y * cos_yaw
 
         # Compute desired roll and pitch
         desired_pitch = math.atan2(-acc_body_x, self.gravity)
@@ -399,14 +401,15 @@ class PositionControllerNode(Node):
             (acc_z / self.gravity) * self.hover_thrust * tilt_compensation)
         thrust_cmd = max(self.min_thrust, min(self.max_thrust, thrust_cmd))
 
-        # Yaw: direct passthrough from target
-        desired_yaw = self.target_yaw
+        # Yaw: convert internal ENU yaw (rad, CCW from East) to PX4 NED yaw (deg, CW from North)
+        desired_yaw_deg_enu = math.degrees(self.target_yaw)
+        desired_yaw = 90.0 - desired_yaw_deg_enu
 
         # === Publish attitude command ===
         cmd = Twist()
         cmd.angular.x = math.degrees(desired_roll)
         cmd.angular.y = math.degrees(desired_pitch)
-        cmd.angular.z = math.degrees(desired_yaw)
+        cmd.angular.z = desired_yaw
         cmd.linear.z = thrust_cmd
         self.cmd_attitude_pub.publish(cmd)
 
