@@ -12,6 +12,7 @@ control authority is required.
 """
 
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -112,8 +113,8 @@ class PositionControllerNode(Node):
         self.current_pitch = 0.0
         self.current_yaw = 0.0
 
-        # Target
-        self.target_position = [0.0, 0.0, 1.5]
+        # Target (initialize to ground, will be set to current position on enable)
+        self.target_position = [0.0, 0.0, 0.0]
         self.target_yaw = 0.0
 
         # Controller state
@@ -122,6 +123,17 @@ class PositionControllerNode(Node):
         self.last_control_time = None
         self.drone_is_offboard = False
 
+        # Feed-forward compensation from manipulator (deg/s in body frame)
+        self.ff_roll_rate = 0.0
+        self.ff_pitch_rate = 0.0
+        self.ff_yaw_rate = 0.0
+        self.ff_last_update = None
+        self.ff_timeout_sec = 0.5
+
+        # Thrust rate limiting
+        self.last_thrust_cmd = self.hover_thrust
+        self.max_thrust_rate = 100.0  # Max thrust change per second (effectively disabled for testing)
+
         # Subscribers
         self.odom_sub = self.create_subscription(
             Odometry, 'telemetry/odom', self._odom_callback, 10)
@@ -129,10 +141,15 @@ class PositionControllerNode(Node):
             PoseStamped, 'target_pose', self._target_callback, 10)
         self.state_sub = self.create_subscription(
             String, 'telemetry/state', self._state_callback, 10)
+        self.feedforward_sub = self.create_subscription(
+            Twist, 'manipulator/feedforward_torques',
+            self._feedforward_callback, 10)
 
         # Publishers
         self.cmd_attitude_pub = self.create_publisher(
             Twist, 'cmd_attitude', 10)
+        self.cmd_rate_pub = self.create_publisher(
+            Twist, 'cmd_attitude_rate', 10)
         self.status_pub = self.create_publisher(
             String, 'controller/status', 10)
 
@@ -140,18 +157,34 @@ class PositionControllerNode(Node):
         self.enable_srv = self.create_service(
             SetBool, 'controller/enable', self._enable_callback)
 
-        # Control loop timer
-        self.control_timer = self.create_timer(
-            1.0 / self.control_rate, self._control_loop)
+        # Control loop timer (100Hz for rate control)
+        control_period = 1.0 / 100.0 if self.use_rate_control else 1.0 / self.control_rate
+        self.control_timer = self.create_timer(control_period, self._control_loop)
 
         # Status publishing timer
         self.status_timer = self.create_timer(0.1, self._publish_status)
 
         self.get_logger().info('UAV Position Controller initialized')
         self.get_logger().info(
+            f'Control mode: {"RATE" if self.use_rate_control else "ATTITUDE"}')
+        self.get_logger().info(
             f'Control rate: {self.control_rate} Hz, '
             f'max tilt: {self.max_tilt_deg} deg, '
             f'hover thrust: {self.hover_thrust}')
+        if self.use_rate_control:
+            self.get_logger().info(
+                f'Attitude PIDs - Roll: kp={self.att_kp_roll}, '
+                f'ki={self.att_ki_roll}, kd={self.att_kd_roll}')
+            self.get_logger().info(
+                f'Attitude PIDs - Pitch: kp={self.att_kp_pitch}, '
+                f'ki={self.att_ki_pitch}, kd={self.att_kd_pitch}')
+            self.get_logger().info(
+                f'Attitude PIDs - Yaw: kp={self.att_kp_yaw}, '
+                f'ki={self.att_ki_yaw}, kd={self.att_kd_yaw}')
+            self.get_logger().info(
+                f'Max rates - Roll: {self.max_roll_rate} deg/s, '
+                f'Pitch: {self.max_pitch_rate} deg/s, '
+                f'Yaw: {self.max_yaw_rate} deg/s')
 
     def _declare_parameters(self):
         """Declare all ROS 2 parameters."""
@@ -173,13 +206,28 @@ class PositionControllerNode(Node):
 
         # Physical parameters
         self.declare_parameter('gravity', 9.81)
-        self.declare_parameter('hover_thrust', 0.5)
+        self.declare_parameter('hover_thrust', 0.6)
         self.declare_parameter('max_tilt_deg', 25.0)
         self.declare_parameter('max_velocity_xy', 2.0)
         self.declare_parameter('max_velocity_z', 1.5)
         self.declare_parameter('min_thrust', 0.1)
         self.declare_parameter('max_thrust', 0.9)
         self.declare_parameter('control_rate', 50.0)
+
+        # Rate control mode and attitude rate PID gains
+        self.declare_parameter('use_rate_control', False)
+        self.declare_parameter('att_kp_roll', 2.0)
+        self.declare_parameter('att_ki_roll', 0.0)
+        self.declare_parameter('att_kd_roll', 0.0)
+        self.declare_parameter('att_kp_pitch', 2.0)
+        self.declare_parameter('att_ki_pitch', 0.0)
+        self.declare_parameter('att_kd_pitch', 0.0)
+        self.declare_parameter('att_kp_yaw', 1.0)
+        self.declare_parameter('att_ki_yaw', 0.0)
+        self.declare_parameter('att_kd_yaw', 0.0)
+        self.declare_parameter('max_roll_rate', 100.0)
+        self.declare_parameter('max_pitch_rate', 100.0)
+        self.declare_parameter('max_yaw_rate', 30.0)
 
     def _load_parameters(self):
         """Load parameters from ROS 2 parameter server."""
@@ -226,6 +274,34 @@ class PositionControllerNode(Node):
         self.control_rate = self.get_parameter(
             'control_rate').get_parameter_value().double_value
 
+        # Rate control parameters
+        self.use_rate_control = self.get_parameter(
+            'use_rate_control').get_parameter_value().bool_value
+        self.att_kp_roll = self.get_parameter(
+            'att_kp_roll').get_parameter_value().double_value
+        self.att_ki_roll = self.get_parameter(
+            'att_ki_roll').get_parameter_value().double_value
+        self.att_kd_roll = self.get_parameter(
+            'att_kd_roll').get_parameter_value().double_value
+        self.att_kp_pitch = self.get_parameter(
+            'att_kp_pitch').get_parameter_value().double_value
+        self.att_ki_pitch = self.get_parameter(
+            'att_ki_pitch').get_parameter_value().double_value
+        self.att_kd_pitch = self.get_parameter(
+            'att_kd_pitch').get_parameter_value().double_value
+        self.att_kp_yaw = self.get_parameter(
+            'att_kp_yaw').get_parameter_value().double_value
+        self.att_ki_yaw = self.get_parameter(
+            'att_ki_yaw').get_parameter_value().double_value
+        self.att_kd_yaw = self.get_parameter(
+            'att_kd_yaw').get_parameter_value().double_value
+        self.max_roll_rate = self.get_parameter(
+            'max_roll_rate').get_parameter_value().double_value
+        self.max_pitch_rate = self.get_parameter(
+            'max_pitch_rate').get_parameter_value().double_value
+        self.max_yaw_rate = self.get_parameter(
+            'max_yaw_rate').get_parameter_value().double_value
+
     def _init_controllers(self):
         """Initialize PID controllers."""
         # Position PIDs (output: desired velocity m/s)
@@ -252,6 +328,17 @@ class PositionControllerNode(Node):
             self.vel_kp_z, self.vel_ki_z, self.vel_kd_z,
             -self.gravity * 0.5, self.gravity * 0.8)
 
+        # Attitude rate PIDs (output: angular velocity deg/s)
+        self.att_pid_roll = PIDController(
+            self.att_kp_roll, self.att_ki_roll, self.att_kd_roll,
+            -self.max_roll_rate, self.max_roll_rate)
+        self.att_pid_pitch = PIDController(
+            self.att_kp_pitch, self.att_ki_pitch, self.att_kd_pitch,
+            -self.max_pitch_rate, self.max_pitch_rate)
+        self.att_pid_yaw = PIDController(
+            self.att_kp_yaw, self.att_ki_yaw, self.att_kd_yaw,
+            -self.max_yaw_rate, self.max_yaw_rate)
+
     def _reset_all_pids(self):
         """Reset all PID controllers."""
         self.pos_pid_x.reset()
@@ -260,6 +347,9 @@ class PositionControllerNode(Node):
         self.vel_pid_x.reset()
         self.vel_pid_y.reset()
         self.vel_pid_z.reset()
+        self.att_pid_roll.reset()
+        self.att_pid_pitch.reset()
+        self.att_pid_yaw.reset()
 
     def _odom_callback(self, msg):
         """Handle odometry from offboard_node."""
@@ -276,6 +366,18 @@ class PositionControllerNode(Node):
             quaternion_to_euler(q.x, q.y, q.z, q.w))
 
         self.odom_received = True
+
+    def _feedforward_callback(self, msg):
+        """
+        Receive feed-forward angular velocity compensation from manipulator.
+
+        msg.angular.x/y/z: Compensating body rates (deg/s) to counteract
+        manipulator reaction torques.
+        """
+        self.ff_roll_rate = msg.angular.x
+        self.ff_pitch_rate = msg.angular.y
+        self.ff_yaw_rate = msg.angular.z
+        self.ff_last_update = time.time()
 
     def _target_callback(self, msg):
         """Handle target pose."""
@@ -317,9 +419,15 @@ class PositionControllerNode(Node):
 
     def _enable_controller(self):
         """Enable controller and reset PIDs."""
+        if not self.odom_received:
+            self.get_logger().warn(
+                'Controller enable requested but no odometry received yet - waiting...')
+            return
+
         self._reset_all_pids()
         self.controller_enabled = True
         self.last_control_time = None
+        self.last_thrust_cmd = self.hover_thrust  # Reset thrust rate limiter
         # Hold current position
         self.target_position = list(self.current_position)
         self.target_yaw = self.current_yaw
@@ -328,6 +436,9 @@ class PositionControllerNode(Node):
             f'[{self.current_position[0]:.2f}, '
             f'{self.current_position[1]:.2f}, '
             f'{self.current_position[2]:.2f}]')
+        self.get_logger().info(
+            f'Target set to current: [{self.target_position[0]:.2f}, '
+            f'{self.target_position[1]:.2f}, {self.target_position[2]:.2f}]')
 
     def _disable_controller(self):
         """Disable the controller."""
@@ -397,21 +508,110 @@ class PositionControllerNode(Node):
             tilt_compensation = 1.0 / (cos_r * cos_p)
         else:
             tilt_compensation = 1.0
-        thrust_cmd = (
+        thrust_cmd_raw = (
             (acc_z / self.gravity) * self.hover_thrust * tilt_compensation)
-        thrust_cmd = max(self.min_thrust, min(self.max_thrust, thrust_cmd))
+        thrust_cmd_raw = max(self.min_thrust, min(self.max_thrust, thrust_cmd_raw))
 
-        # Yaw: convert internal ENU yaw (rad, CCW from East) to PX4 NED yaw (deg, CW from North)
-        desired_yaw_deg_enu = math.degrees(self.target_yaw)
-        desired_yaw = 90.0 - desired_yaw_deg_enu
+        # Apply thrust rate limiting to prevent sudden jumps
+        max_thrust_change = self.max_thrust_rate * dt
+        thrust_diff = thrust_cmd_raw - self.last_thrust_cmd
+        thrust_limited = False
+        if abs(thrust_diff) > max_thrust_change:
+            thrust_cmd = self.last_thrust_cmd + math.copysign(max_thrust_change, thrust_diff)
+            thrust_limited = True
+        else:
+            thrust_cmd = thrust_cmd_raw
+        self.last_thrust_cmd = thrust_cmd
 
-        # === Publish attitude command ===
-        cmd = Twist()
-        cmd.angular.x = math.degrees(desired_roll)
-        cmd.angular.y = math.degrees(desired_pitch)
-        cmd.angular.z = desired_yaw
-        cmd.linear.z = thrust_cmd
-        self.cmd_attitude_pub.publish(cmd)
+        # === Mode-dependent output ===
+        if self.use_rate_control:
+            # ==== RATE CONTROL MODE ====
+            # Compute attitude errors (handle angle wrapping)
+            roll_error = desired_roll - self.current_roll
+            pitch_error = desired_pitch - self.current_pitch
+            yaw_error_rad = self.target_yaw - self.current_yaw
+            # Wrap yaw error to [-pi, pi]
+            yaw_error_rad = math.atan2(
+                math.sin(yaw_error_rad), math.cos(yaw_error_rad))
+            yaw_error_deg = math.degrees(yaw_error_rad)
+
+            # Run attitude PIDs to get feedback rates
+            fb_roll_rate = self.att_pid_roll.compute(
+                math.degrees(roll_error), dt)
+            fb_pitch_rate = self.att_pid_pitch.compute(
+                math.degrees(pitch_error), dt)
+            fb_yaw_rate = self.att_pid_yaw.compute(yaw_error_deg, dt)
+
+            # Add feed-forward compensation (with timeout check)
+            if (self.ff_last_update and
+                    (time.time() - self.ff_last_update < self.ff_timeout_sec)):
+                cmd_roll_rate = fb_roll_rate + self.ff_roll_rate
+                cmd_pitch_rate = fb_pitch_rate + self.ff_pitch_rate
+                cmd_yaw_rate = fb_yaw_rate + self.ff_yaw_rate
+            else:
+                cmd_roll_rate = fb_roll_rate
+                cmd_pitch_rate = fb_pitch_rate
+                cmd_yaw_rate = fb_yaw_rate
+
+            # Coordinate frame conversion for yaw rate:
+            # ENU frame: positive yaw = CCW (left turn)
+            # Body frame: positive yaw rate = CW (right turn)
+            # To increase yaw in ENU, we need NEGATIVE body yaw rate
+            cmd_yaw_rate = -cmd_yaw_rate
+
+            # Debug logging (every 50 iterations = ~0.5s at 100Hz)
+            if not hasattr(self, '_debug_counter'):
+                self._debug_counter = 0
+            self._debug_counter += 1
+            if self._debug_counter % 50 == 0:
+                self.get_logger().info(
+                    f"Position: x={self.current_position[0]:.2f} "
+                    f"y={self.current_position[1]:.2f} "
+                    f"z={self.current_position[2]:.2f}, "
+                    f"Target: x={self.target_position[0]:.2f} "
+                    f"y={self.target_position[1]:.2f} "
+                    f"z={self.target_position[2]:.2f}")
+                self.get_logger().info(
+                    f"Z-axis: pos_err={pos_err_z:.3f} des_vel={des_vel_z:.2f} "
+                    f"cur_vel={self.current_velocity[2]:.2f} vel_err={vel_err_z:.2f}")
+                thrust_limit_str = " [RATE LIMITED]" if thrust_limited else ""
+                self.get_logger().info(
+                    f"Z-accel: {acc_z:.2f}, tilt_comp={tilt_compensation:.3f}, "
+                    f"thrust_raw={thrust_cmd_raw:.3f}, thrust_final={thrust_cmd:.3f}{thrust_limit_str}")
+                self.get_logger().info(
+                    f"XY-PosErr: x={pos_err_x:.2f} y={pos_err_y:.2f}, "
+                    f"XY-Accel: x={acc_x:.2f} y={acc_y:.2f}")
+                self.get_logger().info(
+                    f"Attitude: des_r={math.degrees(desired_roll):.1f}° "
+                    f"des_p={math.degrees(desired_pitch):.1f}° "
+                    f"cur_r={math.degrees(self.current_roll):.1f}° "
+                    f"cur_p={math.degrees(self.current_pitch):.1f}°")
+                self.get_logger().info(
+                    f"Rates: roll={cmd_roll_rate:.1f} pitch={cmd_pitch_rate:.1f} "
+                    f"yaw={cmd_yaw_rate:.1f} deg/s, thrust={thrust_cmd:.3f}")
+
+            # Publish rate command
+            cmd = Twist()
+            cmd.angular.x = cmd_roll_rate  # deg/s
+            cmd.angular.y = cmd_pitch_rate  # deg/s
+            cmd.angular.z = cmd_yaw_rate  # deg/s
+            cmd.linear.z = thrust_cmd  # normalized thrust
+            self.cmd_rate_pub.publish(cmd)
+
+        else:
+            # ==== ATTITUDE ANGLE MODE (backward compatible) ====
+            # Yaw: convert internal ENU yaw (rad, CCW from East) to
+            # PX4 NED yaw (deg, CW from North)
+            desired_yaw_deg_enu = math.degrees(self.target_yaw)
+            desired_yaw = 90.0 - desired_yaw_deg_enu
+
+            # Publish attitude command
+            cmd = Twist()
+            cmd.angular.x = math.degrees(desired_roll)
+            cmd.angular.y = math.degrees(desired_pitch)
+            cmd.angular.z = desired_yaw
+            cmd.linear.z = thrust_cmd
+            self.cmd_attitude_pub.publish(cmd)
 
     def _publish_status(self):
         """Publish controller status."""

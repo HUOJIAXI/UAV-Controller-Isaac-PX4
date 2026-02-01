@@ -53,8 +53,49 @@ def generate_launch_description():
         'gui', default_value='true',
         description='Launch control panel GUI')
     hover_thrust_arg = DeclareLaunchArgument(
-        'hover_thrust', default_value='0.5',
+        'hover_thrust', default_value='0.6',
         description='Normalized hover thrust (0-1)')
+
+    # Rate control parameters
+    use_rate_control_arg = DeclareLaunchArgument(
+        'use_rate_control', default_value='true',
+        description='Use rate control (true) or attitude control (false)')
+    att_kp_roll_arg = DeclareLaunchArgument(
+        'att_kp_roll', default_value='2.0',
+        description='Attitude rate PID proportional gain for roll')
+    att_ki_roll_arg = DeclareLaunchArgument(
+        'att_ki_roll', default_value='0.0',
+        description='Attitude rate PID integral gain for roll')
+    att_kd_roll_arg = DeclareLaunchArgument(
+        'att_kd_roll', default_value='0.0',
+        description='Attitude rate PID derivative gain for roll')
+    att_kp_pitch_arg = DeclareLaunchArgument(
+        'att_kp_pitch', default_value='2.0',
+        description='Attitude rate PID proportional gain for pitch')
+    att_ki_pitch_arg = DeclareLaunchArgument(
+        'att_ki_pitch', default_value='0.0',
+        description='Attitude rate PID integral gain for pitch')
+    att_kd_pitch_arg = DeclareLaunchArgument(
+        'att_kd_pitch', default_value='0.0',
+        description='Attitude rate PID derivative gain for pitch')
+    att_kp_yaw_arg = DeclareLaunchArgument(
+        'att_kp_yaw', default_value='1.0',
+        description='Attitude rate PID proportional gain for yaw')
+    att_ki_yaw_arg = DeclareLaunchArgument(
+        'att_ki_yaw', default_value='0.0',
+        description='Attitude rate PID integral gain for yaw')
+    att_kd_yaw_arg = DeclareLaunchArgument(
+        'att_kd_yaw', default_value='0.0',
+        description='Attitude rate PID derivative gain for yaw')
+    max_roll_rate_arg = DeclareLaunchArgument(
+        'max_roll_rate', default_value='100.0',
+        description='Maximum roll rate (deg/s)')
+    max_pitch_rate_arg = DeclareLaunchArgument(
+        'max_pitch_rate', default_value='100.0',
+        description='Maximum pitch rate (deg/s)')
+    max_yaw_rate_arg = DeclareLaunchArgument(
+        'max_yaw_rate', default_value='30.0',
+        description='Maximum yaw rate (deg/s)')
 
     # Compute namespace
     node_namespace = PythonExpression([
@@ -100,15 +141,15 @@ def generate_launch_description():
             'pos_kp_xy': 1.2,
             'pos_ki_xy': 0.0,
             'pos_kd_xy': 0.0,
-            'pos_kp_z': 1.5,
-            'pos_ki_z': 0.05,
+            'pos_kp_z': 1.2,
+            'pos_ki_z': 0.0,
             'pos_kd_z': 0.0,
             # Velocity PID gains
             'vel_kp_xy': 1.5,
             'vel_ki_xy': 0.2,
             'vel_kd_xy': 0.05,
-            'vel_kp_z': 3.0,
-            'vel_ki_z': 0.5,
+            'vel_kp_z': 2.0,
+            'vel_ki_z': 0.0,
             'vel_kd_z': 0.1,
             # Physical parameters
             'gravity': 9.81,
@@ -119,6 +160,20 @@ def generate_launch_description():
             'min_thrust': 0.1,
             'max_thrust': 0.9,
             'control_rate': 50.0,
+            # Rate control parameters
+            'use_rate_control': LaunchConfiguration('use_rate_control'),
+            'att_kp_roll': LaunchConfiguration('att_kp_roll'),
+            'att_ki_roll': LaunchConfiguration('att_ki_roll'),
+            'att_kd_roll': LaunchConfiguration('att_kd_roll'),
+            'att_kp_pitch': LaunchConfiguration('att_kp_pitch'),
+            'att_ki_pitch': LaunchConfiguration('att_ki_pitch'),
+            'att_kd_pitch': LaunchConfiguration('att_kd_pitch'),
+            'att_kp_yaw': LaunchConfiguration('att_kp_yaw'),
+            'att_ki_yaw': LaunchConfiguration('att_ki_yaw'),
+            'att_kd_yaw': LaunchConfiguration('att_kd_yaw'),
+            'max_roll_rate': LaunchConfiguration('max_roll_rate'),
+            'max_pitch_rate': LaunchConfiguration('max_pitch_rate'),
+            'max_yaw_rate': LaunchConfiguration('max_yaw_rate'),
         }])
 
     # 3. Control panel (optional)
@@ -139,6 +194,19 @@ def generate_launch_description():
         namespace_arg,
         gui_arg,
         hover_thrust_arg,
+        use_rate_control_arg,
+        att_kp_roll_arg,
+        att_ki_roll_arg,
+        att_kd_roll_arg,
+        att_kp_pitch_arg,
+        att_ki_pitch_arg,
+        att_kd_pitch_arg,
+        att_kp_yaw_arg,
+        att_ki_yaw_arg,
+        att_kd_yaw_arg,
+        max_roll_rate_arg,
+        max_pitch_rate_arg,
+        max_yaw_rate_arg,
         offboard_node,
         controller_node,
         control_panel_node,

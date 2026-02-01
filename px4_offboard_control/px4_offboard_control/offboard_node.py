@@ -727,6 +727,12 @@ class OffboardControlNode(Node):
         - angular.z -> Yaw rate (deg/s)
         """
         with self._lock:
+            # Auto-switch to VELOCITY mode when receiving velocity commands
+            if self._control_mode != ControlMode.VELOCITY:
+                self._control_mode = ControlMode.VELOCITY
+                self.get_logger().info(
+                    "Auto-switched to VELOCITY mode (received cmd_vel)")
+
             self._cmd_north_m_s = msg.linear.x
             self._cmd_east_m_s = msg.linear.y
             self._cmd_down_m_s = -msg.linear.z  # Up is positive in ROS, Down is positive in NED
@@ -770,6 +776,12 @@ class OffboardControlNode(Node):
         Note: angular rates follow body frame convention.
         """
         with self._lock:
+            # Auto-switch to ATTITUDE_RATE mode when receiving rate commands
+            if self._control_mode != ControlMode.ATTITUDE_RATE:
+                self._control_mode = ControlMode.ATTITUDE_RATE
+                self.get_logger().info(
+                    "Auto-switched to ATTITUDE_RATE mode (received cmd_attitude_rate)")
+
             self._cmd_roll_rate_deg_s = msg.angular.x
             self._cmd_pitch_rate_deg_s = msg.angular.y
             self._cmd_yaw_rate_deg_s = msg.angular.z
@@ -791,6 +803,12 @@ class OffboardControlNode(Node):
         - linear.z  -> Thrust (normalized 0-1, ~0.5 for hover)
         """
         with self._lock:
+            # Auto-switch to ATTITUDE mode when receiving attitude commands
+            if self._control_mode != ControlMode.ATTITUDE:
+                self._control_mode = ControlMode.ATTITUDE
+                self.get_logger().info(
+                    "Auto-switched to ATTITUDE mode (received cmd_attitude)")
+
             self._cmd_roll_deg = msg.angular.x
             self._cmd_pitch_deg = msg.angular.y
             self._cmd_yaw_deg_attitude = msg.angular.z
