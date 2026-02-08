@@ -58,6 +58,12 @@ def generate_launch_description():
     hover_thrust_arg = DeclareLaunchArgument(
         'hover_thrust', default_value='0.6',
         description='Normalized hover thrust (0-1)')
+    imu_rate_hz_arg = DeclareLaunchArgument(
+        'imu_rate_hz', default_value='50.0',
+        description='IMU telemetry publish rate (Hz)')
+    odom_rate_hz_arg = DeclareLaunchArgument(
+        'odom_rate_hz', default_value='50.0',
+        description='Odom/telemetry publish rate (Hz)')
 
     # Rate control parameters
     use_rate_control_arg = DeclareLaunchArgument(
@@ -114,6 +120,10 @@ def generate_launch_description():
         gui = LaunchConfiguration('gui').perform(context)
         hover_thrust = LaunchConfiguration(
             'hover_thrust').perform(context)
+        imu_rate_hz = float(LaunchConfiguration(
+            'imu_rate_hz').perform(context))
+        odom_rate_hz = float(LaunchConfiguration(
+            'odom_rate_hz').perform(context))
 
         # Rate control parameters
         use_rate_control = LaunchConfiguration(
@@ -166,6 +176,9 @@ def generate_launch_description():
                     'cmd_timeout_sec': 0.5,
                     'yaw_mode': 'angle',
                     'hover_thrust': float(hover_thrust),
+                    'imu_rate_hz': imu_rate_hz,
+                    'odom_rate_hz': odom_rate_hz,
+                    'use_sim_time': True,
                 }]))
 
             # Position controller
@@ -210,6 +223,7 @@ def generate_launch_description():
                     'max_roll_rate': max_roll_rate,
                     'max_pitch_rate': max_pitch_rate,
                     'max_yaw_rate': max_yaw_rate,
+                    'use_sim_time': True,
                 }]))
 
             # Control panel (optional)
@@ -231,6 +245,8 @@ def generate_launch_description():
         host_arg,
         gui_arg,
         hover_thrust_arg,
+        imu_rate_hz_arg,
+        odom_rate_hz_arg,
         use_rate_control_arg,
         att_kp_roll_arg,
         att_ki_roll_arg,

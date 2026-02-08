@@ -22,6 +22,7 @@ Author: Generated for PX4 + Isaac Sim + Pegasus integration
 """
 
 import asyncio
+import math
 import threading
 import time
 from enum import Enum
@@ -34,6 +35,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import Twist, PoseStamped, TwistStamped, Vector3Stamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from std_msgs.msg import String, Float32
 from std_srvs.srv import SetBool, Trigger
 
@@ -86,6 +88,8 @@ class OffboardControlNode(Node):
         self.declare_parameter('control_mode', 'velocity')  # 'velocity' or 'acceleration'
         self.declare_parameter('reconnect_interval_sec', 3.0)
         self.declare_parameter('hover_thrust', 0.5)  # Normalized thrust for hover (0-1)
+        self.declare_parameter('imu_rate_hz', 50.0)  # IMU telemetry stream rate from PX4
+        self.declare_parameter('odom_rate_hz', 50.0)  # Odom/telemetry publish rate
 
         # Get parameters
         self.drone_id = self.get_parameter('drone_id').get_parameter_value().integer_value
@@ -97,6 +101,8 @@ class OffboardControlNode(Node):
         self.control_mode = self.get_parameter('control_mode').get_parameter_value().string_value
         self.reconnect_interval_sec = self.get_parameter('reconnect_interval_sec').get_parameter_value().double_value
         self.hover_thrust = self.get_parameter('hover_thrust').get_parameter_value().double_value
+        self.imu_rate_hz = self.get_parameter('imu_rate_hz').get_parameter_value().double_value
+        self.odom_rate_hz = self.get_parameter('odom_rate_hz').get_parameter_value().double_value
 
         self.get_logger().info(f"Drone ID: {self.drone_id}")
         self.get_logger().info(f"Connection URL: {self.connection_url}")
@@ -155,6 +161,8 @@ class OffboardControlNode(Node):
         self._attitude_euler = (0.0, 0.0, 0.0)  # Roll, Pitch, Yaw (degrees)
         self._position_global = (0.0, 0.0, 0.0)  # Lat, Lon, Alt
         self._px4_thrust_setpoint = self.hover_thrust  # Current thrust setpoint from PX4
+        self._imu_accel_flu = [0.0, 0.0, 9.81]  # Cached linear acceleration (FLU, m/s^2)
+        self._angular_velocity_frd = (0.0, 0.0, 0.0)  # Cached angular velocity (roll, pitch, yaw) rad/s
 
         # MAVSDK system
         self._drone: Optional[System] = None
@@ -213,6 +221,7 @@ class OffboardControlNode(Node):
         self.state_pub = self.create_publisher(String, 'telemetry/state', 10)
         self.control_mode_pub = self.create_publisher(String, 'control_mode', 10)
         self.thrust_setpoint_pub = self.create_publisher(Float32, 'telemetry/thrust_setpoint', 10)
+        self.imu_pub = self.create_publisher(Imu, 'telemetry/imu', 10)
 
         # Services (relative names so they respect namespace)
         self.arm_srv = self.create_service(SetBool, 'arm', self._arm_callback)
@@ -229,7 +238,12 @@ class OffboardControlNode(Node):
         )
 
         # Timer for publishing telemetry
-        self.telemetry_timer = self.create_timer(0.1, self._publish_telemetry)  # 10 Hz
+        odom_period = 1.0 / self.odom_rate_hz
+        self.telemetry_timer = self.create_timer(odom_period, self._publish_telemetry)
+
+        # High-rate timer for IMU publishing (decoupled from MAVSDK stream rate)
+        imu_period = 1.0 / self.imu_rate_hz
+        self.imu_timer = self.create_timer(imu_period, self._publish_imu)
 
         # Start asyncio event loop in background thread
         self._start_asyncio_loop()
@@ -358,7 +372,17 @@ class OffboardControlNode(Node):
                     self.get_logger().info(f"Waiting for drone... ({attempt}s)")
 
             except Exception as e:
-                self.get_logger().warn(f"Connection probe failed: {type(e).__name__}: {e}")
+                # During initial connection, telemetry plugin may not be ready yet
+                # This is expected - just log at debug level and retry
+                error_str = str(e)
+                if "not been initialized" in error_str or "Did you run" in error_str:
+                    # Expected during connection setup - only log at debug level
+                    if attempt == 1 or attempt % 10 == 0:  # Log occasionally
+                        self.get_logger().debug(f"Waiting for MAVSDK telemetry to initialize... ({attempt}s)")
+                else:
+                    # Unexpected error - log as warning
+                    self.get_logger().warn(f"Connection probe error: {type(e).__name__}: {e}")
+
                 import traceback
                 self.get_logger().debug(traceback.format_exc())
                 await asyncio.sleep(0.5)
@@ -387,6 +411,11 @@ class OffboardControlNode(Node):
 
         # Actuator control target (for reading PX4's thrust setpoint)
         self._telemetry_tasks.append(asyncio.create_task(self._monitor_actuator_control()))
+        await asyncio.sleep(0.1)
+
+        # IMU: high-rate angular velocity + cached linear acceleration
+        self._telemetry_tasks.append(asyncio.create_task(self._monitor_imu()))
+        self._telemetry_tasks.append(asyncio.create_task(self._monitor_imu_accel()))
         await asyncio.sleep(0.1)
 
         # Flight mode and armed state
@@ -595,6 +624,56 @@ class OffboardControlNode(Node):
                             self._px4_thrust_setpoint = max(0.0, min(1.0, normalized_thrust))
         except Exception as e:
             self.get_logger().debug(f"Actuator control monitor ended: {e}")
+            raise
+
+    async def _monitor_imu(self):
+        """
+        Cache angular velocity from the ATTITUDE_QUATERNION MAVLink stream.
+
+        The actual IMU publishing is done by the _publish_imu timer at
+        imu_rate_hz, decoupled from MAVSDK's stream rate.
+        """
+        try:
+            try:
+                await self._drone.telemetry.set_rate_attitude_quaternion(
+                    self.imu_rate_hz)
+            except Exception:
+                pass  # best effort
+
+            async for ang_vel in (
+                    self._drone.telemetry.attitude_angular_velocity_body()):
+                with self._lock:
+                    self._angular_velocity_frd = (
+                        ang_vel.roll_rad_s,
+                        ang_vel.pitch_rad_s,
+                        ang_vel.yaw_rad_s,
+                    )
+        except Exception as e:
+            self.get_logger().debug(f"Angular velocity monitor ended: {e}")
+            raise
+
+    async def _monitor_imu_accel(self):
+        """
+        Cache linear acceleration from the HIGHRES_IMU stream (~3-4 Hz).
+
+        This runs as a background task; the main _monitor_imu reads
+        the cached values at the higher attitude stream rate.
+        """
+        try:
+            try:
+                await self._drone.telemetry.set_rate_imu(self.imu_rate_hz)
+            except Exception:
+                pass  # best effort — PX4 SITL may not honor this
+
+            async for imu_data in self._drone.telemetry.imu():
+                with self._lock:
+                    self._imu_accel_flu = [
+                        imu_data.acceleration_frd.forward_m_s2,
+                        -imu_data.acceleration_frd.right_m_s2,
+                        -imu_data.acceleration_frd.down_m_s2,
+                    ]
+        except Exception as e:
+            self.get_logger().debug(f"IMU accel monitor ended: {e}")
             raise
 
     async def _setpoint_loop(self):
@@ -873,7 +952,6 @@ class OffboardControlNode(Node):
         pose_msg.pose.position.z = -pos[2]  # Down  -> Up (sim Z)
 
         # Full quaternion from Euler angles (roll, pitch, yaw) - ZYX convention
-        import math
         roll_rad = math.radians(att[0])
         pitch_rad = math.radians(att[1])
         # Convert PX4 yaw (clockwise from North, NED) to ENU/ROS yaw (CCW from East)
@@ -911,6 +989,49 @@ class OffboardControlNode(Node):
         odom_msg.pose.pose = pose_msg.pose
         odom_msg.twist.twist = twist_msg.twist
         self.odom_pub.publish(odom_msg)
+
+    def _publish_imu(self):
+        """Publish IMU data at imu_rate_hz from cached telemetry."""
+        with self._lock:
+            if not self._is_connected:
+                return
+            att = self._attitude_euler
+            ang_vel = self._angular_velocity_frd
+            accel = list(self._imu_accel_flu)
+
+        imu_msg = Imu()
+        # Use ROS clock (will use /clock topic if use_sim_time=True)
+        imu_msg.header.stamp = self.get_clock().now().to_msg()
+        imu_msg.header.frame_id = "base_link"
+
+        # Orientation: NED euler -> ENU quaternion
+        roll_rad = math.radians(att[0])
+        pitch_rad = math.radians(att[1])
+        yaw_rad = math.radians(90.0 - att[2])
+
+        cr = math.cos(roll_rad / 2)
+        sr = math.sin(roll_rad / 2)
+        cp = math.cos(pitch_rad / 2)
+        sp = math.sin(pitch_rad / 2)
+        cy = math.cos(yaw_rad / 2)
+        sy = math.sin(yaw_rad / 2)
+
+        imu_msg.orientation.w = cr * cp * cy + sr * sp * sy
+        imu_msg.orientation.x = sr * cp * cy - cr * sp * sy
+        imu_msg.orientation.y = cr * sp * cy + sr * cp * sy
+        imu_msg.orientation.z = cr * cp * sy - sr * sp * cy
+
+        # Angular velocity: FRD -> FLU
+        imu_msg.angular_velocity.x = ang_vel[0]
+        imu_msg.angular_velocity.y = -ang_vel[1]
+        imu_msg.angular_velocity.z = -ang_vel[2]
+
+        # Linear acceleration (already FLU from _monitor_imu_accel)
+        imu_msg.linear_acceleration.x = accel[0]
+        imu_msg.linear_acceleration.y = accel[1]
+        imu_msg.linear_acceleration.z = accel[2]
+
+        self.imu_pub.publish(imu_msg)
 
     def _check_ready(self) -> tuple:
         """Check if drone is connected and ready. Returns (is_ready, error_message)."""
@@ -1232,8 +1353,6 @@ class OffboardControlNode(Node):
         Returns:
             float: Estimated normalized thrust (0-1)
         """
-        import math
-
         with self._lock:
             roll_deg = self._attitude_euler[0]
             pitch_deg = self._attitude_euler[1]
